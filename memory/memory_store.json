@@ -1,0 +1,14 @@
+{
+  "facts": [
+    {
+      "text": "I love AI",
+      "created_at": "2026-01-19T21:32:14.092041",
+      "source": "user"
+    },
+    {
+      "text": "you should stop calling your beta",
+      "created_at": "2026-01-19T21:32:30.797534",
+      "source": "user"
+    }
+  ]
+}
