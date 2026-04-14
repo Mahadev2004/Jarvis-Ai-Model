@@ -1,0 +1,3449 @@
+# main.py
+
+from __future__ import annotations
+import time
+from stt.whisper_cpp import WhisperSTT
+from brain.llm_offline import BrainLLM
+from skills.router import IntentRouter
+from tts.tts_edge import SimpleTTS
+from memory.background_learner import BackgroundLearner
+
+
+EXIT_WORDS = {
+"quit",
+"exit",
+"band ho jao",
+"close yourself",
+"stop jarvis",
+"jarvis stop",
+"jarvis band ho jao",
+}
+
+
+def main():
+# ---- Init core components ----
+stt = WhisperSTT()
+brain = BrainLLM()
+router = IntentRouter()
+tts = SimpleTTS()
+
+for msg in router.jobs.pop_done_messages():
+tts.speak(msg)
+
+
+# ---- Background learner (Memory v2) ----
+try:
+bg_learner = BackgroundLearner(brain=brain, interval_seconds=600) # 10 min
+bg_learner.start()
+print("[BackgroundLearner] Started with interval=600 seconds")
+except Exception as e:
+print("[BackgroundLearner] Failed to start:", e)
+
+chat_history = []
+
+print("🤖 Jarvis: Namaste, main Jarvis hoon, ready for your command.\n")
+print("Speak your command, or say 'quit' to exit.\n")
+
+# announce completed background jobs (if any)
+try:
+done = router.jobs.pop_done_messages()
+for jr in done:
+msg = jr.message or "Background task done."
+print(f"🤖 Jarvis: {msg}")
+try:
+tts.speak(msg, stt=stt, enable_barge_in=True)
+except Exception:
+pass
+except Exception as e:
+print("[Main] background announce error:", e)
+
+
+# ---- Main loop: 1 turn = 1 command ----
+while True:
+print("🎙️ Listening...")
+user_text = stt.listen_and_transcribe(duration=5)
+
+if not user_text or not user_text.strip():
+msg = "Mujhe kuch samajh nahi aaya, please repeat."
+print(f"🤖 Jarvis: {msg}\n")
+try:
+tts.speak(msg)
+except Exception as e:
+print("[Main] TTS error (empty input):", e)
+continue
+
+user_text = user_text.strip()
+print(f"🗣️ You said: {user_text}")
+lower = user_text.lower()
+
+# ---- Exit ----
+if lower in EXIT_WORDS:
+bye = "Theek hai, main ab band ho raha hoon. Bye."
+print(f"🤖 Jarvis: {bye}")
+try:
+tts.speak(bye)
+finally:
+break
+
+# ---- Route + Brain reply ----
+try:
+reply = router.handle(user_text, brain=brain, chat_history=chat_history)
+except TypeError:
+# In case router.handle brain/chat_history accept nahi karta ho
+reply = router.handle(user_text)
+except Exception as e:
+print("[Main] Error in router.handle:", e)
+reply = "Mujhe command samajhne mein thoda issue aa gaya."
+
+reply = (reply or "").strip()
+if not reply:
+reply = "Mujhe samajh nahi aaya, ek baar phir se bol do."
+
+# ---- Chat history / learning ----
+chat_history.append({"role": "user", "content": user_text})
+chat_history.append({"role": "assistant", "content": reply})
+
+try:
+brain.learn_from_turn(user_text, reply)
+except Exception as e:
+print("[Main] learn_from_turn error:", e)
+
+# Auto memory learning
+try:
+from skills import memory_skill
+memory_skill.auto_learn_from_turn(user_text, reply, brain=brain)
+except Exception as e:
+print("[Main] auto memory error:", e)
+
+# ---- Output (text + speech) ----
+print(f"🤖 Jarvis: {reply}\n")
+try:
+# BARGE-IN abhi off rakha hai → simple speak
+tts.speak(reply)
+except Exception as e:
+print("[Main] TTS error:", e)
+
+
+if __name__ == "__main__":
+main()
+# config.py
+from pathlib import Path
+import torch
+
+# ========= BASE PATHS =========
+
+# Folder where config.py lives (your project root)
+BASE_DIR = Path(__file__).resolve().parent
+
+# Models folder inside the project
+MODELS_DIR = BASE_DIR / "models"
+
+# ========= MODELS & BINARIES =========
+# IMPORTANT: adjust WHISPER_CPP_EXE to where your compiled whisper.cpp `main.exe` is.
+
+# Example: if you have whisper.cpp in D:\tools\whisper.cpp\
+WHISPER_CPP_EXE = r"C:\Abhay\jarvis_assistant_win\models\whisper\whisper.cpp\build\bin\Release\main.exe"
+
+# When you download the Whisper ggml model, put it in:
+# models/whisper/ggml-large-v3.bin (or whatever name you use)
+WHISPER_MODEL = str(MODELS_DIR / "whisper" / "ggml-large-v3.bin")
+
+# LLaMA 3 model:
+# models/llm/Llama-3-8B-Instruct.Q4_K_M.gguf
+LLM_MODEL_PATH = str(MODELS_DIR / "llm" / "Llama-3-8B-Instruct.Q4_K_M.gguf")
+
+# Stable Diffusion model:
+# models/sd/v1-5-pruned-emaonly.safetensors
+SD_MODEL_PATH = str(MODELS_DIR / "sd" / "v1-5-pruned-emaonly.safetensors")
+
+# Stable Video Diffusion model:
+# models/sdxl/svd_xt_1_1.safetensors
+SVD_MODEL_PATH = str(MODELS_DIR / "sdxl" / "svd_xt_1_1.safetensors")
+
+# ========= RUNTIME CONFIG =========
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+WAKE_WORD = "jarvis"
+
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+IMAGE_OUTPUT_DIR = BASE_DIR / "generated_images"
+VIDEO_OUTPUT_DIR = BASE_DIR / "generated_videos"
+
+for p in (DOWNLOAD_DIR, IMAGE_OUTPUT_DIR, VIDEO_OUTPUT_DIR):
+p.mkdir(exist_ok=True)
+
+
+# Known safe software for auto-download
+KNOWN_SOFTWARE_SOURCES = {
+"python": {
+"name": "Python",
+"url": "https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe",
+},
+"vlc": {
+"name": "VLC media player",
+"url": "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe",
+},
+"vs code": {
+"name": "Visual Studio Code",
+"url": "https://update.code.visualstudio.com/latest/win32-x64-user/stable",
+},
+"chrome": {
+"name": "Google Chrome",
+"url": "https://dl.google.com/chrome/install/latest/chrome_installer.exe",
+},
+}
+
+# brain/llm_offline.py
+from __future__ import annotations
+import json
+from typing import List, Dict, Any
+from llama_cpp import Llama
+from config import LLM_MODEL_PATH # tumhare config.py me defined
+
+# Optional defaults; agar future me config me add karna ho to easy hai
+LLM_CTX = 4096
+LLM_MAX_TOKENS = 512
+
+
+class BrainLLM:
+"""
+Offline LLaMA-3 based brain.
+
+Features:
+- Hinglish friendly (English + Hindi mix).
+- ChatGPT-style reasoning + coding help.
+- Dev / coding tasks ke liye bahut detail code dega.
+"""
+
+def __init__(self):
+print(f"[BrainLLM] Loading LLaMA model from: {LLM_MODEL_PATH}")
+self.llm = Llama(
+model_path=LLM_MODEL_PATH,
+n_ctx=LLM_CTX,
+logits_all=False,
+n_threads=0, # 0 => auto-detect based on CPU cores
+)
+
+# Base identity / behaviour prompt
+self.system_prompt = (
+"You are Jarvis (also called Sakha), a personal AI assistant for Abhay. "
+"You speak in a natural, relaxed Hinglish style: mix of simple English "
+"and Hindi, but avoid overusing English where Hindi is more natural.\n\n"
+"CORE BEHAVIOUR:\n"
+"- Be calm, friendly, and practical.\n"
+"- Focus on clarity. Avoid very long essays unless specifically asked.\n"
+"- For facts or explanations, be accurate and step-by-step.\n"
+"- You can reason deeply about math, physics, computer science, and coding.\n"
+"- If the user sounds confused, explain gently with small simple steps.\n\n"
+"CODING / DEV MODE:\n"
+"- If the user asks for code, programs, scripts, or 'bana do', "
+" switch to DEV mindset.\n"
+"- Always give COMPLETE usable code blocks, not half code.\n"
+"- Prefer Python for scripts unless the user explicitly asks for a language.\n"
+"- For websites, create minimal but functional HTML/CSS/JS.\n"
+"- Add short, useful comments in English.\n"
+"- If some requirement is underspecified, assume reasonable defaults "
+" instead of forcing the user to clarify.\n\n"
+"PLANNING / STEPS:\n"
+"- If the user asks for a plan, roadmap, or step-by-step approach, "
+" produce a clear numbered list of steps.\n"
+"- Distinguish between phases (e.g., Phase 1: Setup, Phase 2: Core Logic, etc.).\n\n"
+"STYLE:\n"
+"- Address Abhay directly as 'tum' in Hindi, but respectfully.\n"
+"- Avoid very heavy Shuddh Hindi; keep it conversational.\n"
+"- Occasionally add small motivational or friendly tone, but do NOT overdo.\n"
+"- Important formulas or code should not be mixed with Hindi; keep them clean.\n\n"
+"SAFETY:\n"
+"- Do not provide any harmful, illegal, or unsafe instructions.\n"
+"- Do not invent sensitive personal details.\n"
+)
+
+# ---------------- core chat ---------------- #
+
+def chat(self, history: List[Dict[str, str]]) -> str:
+"""
+:param history: list of {role: 'user'|'assistant'|'system', content: str}
+"""
+if not isinstance(history, list) or not history:
+history = []
+
+# System message ko ensure karo
+messages: List[Dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
+for m in history:
+role = m.get("role", "user")
+content = m.get("content", "")
+if not content:
+continue
+if role not in ("system", "user", "assistant"):
+role = "user"
+messages.append({"role": role, "content": content})
+
+# llama_cpp chat completion
+res: Dict[str, Any] = self.llm.create_chat_completion(
+messages=messages,
+max_tokens=LLM_MAX_TOKENS,
+temperature=0.7,
+top_p=0.9,
+)
+
+try:
+return res["choices"][0]["message"]["content"].strip()
+except Exception:
+return "Mujhe reply generate karte waqt ek internal error aa gaya."
+
+# ------------------ NEW: Intent classifier ------------------ #
+def classify_intent(self, text: str, allowed_intents: list[str]) -> str:
+"""
+LLaMA se poochta hai: user ne kya bola, aur in allowed_intents me se
+kaunsa sabse sahi intent hai?
+
+Expected output from model (strict JSON):
+{"intent": "camera_check"}
+"""
+
+if not text or not text.strip():
+return "chat"
+
+# Safety: agar model crash ho jaaye to fallback
+try:
+system_prompt = (
+"You are an intent classifier for a voice assistant named Jarvis.\n"
+"Your job is ONLY to choose the best intent from a fixed list.\n"
+"You MUST respond in strict JSON, e.g.:\n"
+'{"intent": "camera_check"}\n\n'
+"Rules:\n"
+" - Only choose from the allowed intents list.\n"
+" - If you are not sure, use \"chat\".\n"
+" - Do not add explanations.\n"
+)
+
+user_prompt = (
+"User said (might be Hindi, English or Hinglish):\n"
+f"\"{text}\"\n\n"
+"Allowed intents:\n"
++ ", ".join(f'"{i}"' for i in allowed_intents)
++ "\n\n"
+"Return JSON now."
+)
+
+res = self.llm.create_chat_completion(
+messages=[
+{"role": "system", "content": system_prompt},
+{"role": "user", "content": user_prompt},
+],
+temperature=0.1,
+max_tokens=64,
+)
+
+reply = res["choices"][0]["message"]["content"].strip()
+
+# Kabhi kabhi model JSON ke bahar text de deta hai, to thoda clean karte hain
+# Try to find the first '{' and last '}' and parse between them
+if "{" in reply and "}" in reply:
+start = reply.index("{")
+end = reply.rindex("}") + 1
+reply = reply[start:end]
+
+data = json.loads(reply)
+intent = str(data.get("intent", "")).strip()
+
+if not intent or intent not in allowed_intents:
+return "chat"
+
+return intent
+
+except Exception as e:
+print("[BrainLLM.classify_intent] Error:", e)
+return "chat"
+
+
+# ---------------- learning hook ---------------- #
+
+def learn_from_turn(self, user_text: str, reply: str) -> None:
+"""
+Simple hook: future me isko smarter banaya ja sakta hai.
+
+Abhi ke liye:
+- conversation ko memory store me as-is save kar deta hai (optional).
+"""
+if not user_text or not reply:
+return
+
+try:
+from memory.memory_store import get_memory_store
+
+store = get_memory_store()
+combined = f"user: {user_text.strip()}\nassistant: {reply.strip()}"
+store.add(
+text=combined,
+category="conversation",
+source="auto",
+tags=["turn_pair"],
+)
+except Exception as e:
+print("[BrainLLM] learn_from_turn error:", e)
+# identity/face_db.py
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Optional, List
+
+import cv2
+import numpy as np
+
+
+IDENTITY_DIR = Path(__file__).resolve().parent
+MODEL_FILE = IDENTITY_DIR / "face_lbph.xml"
+NAME_FILE = IDENTITY_DIR / "face_name.txt"
+
+
+class FaceIdentityManager:
+"""
+Simple OpenCV-based face identity (no dlib, no face_recognition).
+
+Limitations:
+- Best for ek primary user (Abhay).
+- Lighting, camera angle bohot matter karega.
+"""
+
+def __init__(self):
+self.name: str = "Abhay"
+self.recognizer: Optional[cv2.face_LBPHFaceRecognizer] = None # type: ignore
+self.face_cascade = cv2.CascadeClassifier(
+cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+self._load_model()
+
+# ---------------- internal helpers ---------------- #
+
+def _ensure_lib(self) -> Optional[str]:
+if not hasattr(cv2, "face"):
+return (
+"Face recognition ke liye OpenCV ka 'contrib' module chahiye.\n"
+"PowerShell me yeh command chalao:\n"
+" pip install opencv-contrib-python\n"
+)
+return None
+
+def _load_model(self) -> None:
+"""Agar trained model / naam saved hai to load karo."""
+try:
+if MODEL_FILE.exists() and hasattr(cv2, "face"):
+self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+self.recognizer.read(str(MODEL_FILE))
+print(f"[FaceID] Loaded LBPH model from {MODEL_FILE}")
+if NAME_FILE.exists():
+name = NAME_FILE.read_text(encoding="utf-8").strip()
+if name:
+self.name = name
+print(f"[FaceID] Loaded name: {self.name}")
+except Exception as e:
+print("[FaceID] Failed to load model:", e)
+self.recognizer = None
+
+def _save_model(self, name: str) -> None:
+try:
+if self.recognizer is not None:
+self.recognizer.write(str(MODEL_FILE))
+print(f"[FaceID] Saved LBPH model to {MODEL_FILE}")
+NAME_FILE.write_text(name.strip() or "Abhay", encoding="utf-8")
+print(f"[FaceID] Saved name: {name}")
+except Exception as e:
+print("[FaceID] Failed to save model:", e)
+
+# ---------------- PUBLIC: ENROLL ---------------- #
+
+def enroll_from_camera(
+self,
+name: str = "Abhay",
+camera_index: int = 0,
+num_samples: int = 15,
+timeout_sec: int = 30,
+) -> str:
+"""
+Webcam se multiple face samples lekar LBPH recognizer train karega.
+
+Steps:
+- Camera on karega
+- Tumhe center me dekhna hai, thoda head move kar sakte ho
+- 15 face crops lekar model train karega
+"""
+
+lib_err = self._ensure_lib()
+if lib_err:
+return lib_err
+
+cap = cv2.VideoCapture(camera_index)
+if not cap.isOpened():
+return "Camera open nahi ho raha, please webcam / permissions check karo."
+
+print("[FaceID] Enrolling Abhay's face. Please look at the camera...")
+
+samples: List[np.ndarray] = []
+labels: List[int] = []
+start = time.time()
+
+while len(samples) < num_samples and (time.time() - start) < timeout_sec:
+ret, frame = cap.read()
+if not ret or frame is None:
+continue
+
+gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+faces = self.face_cascade.detectMultiScale(
+gray,
+scaleFactor=1.2,
+minNeighbors=5,
+minSize=(80, 80),
+)
+
+if len(faces) != 1:
+# ya to koi face nahi, ya multiple faces — skip
+continue
+
+(x, y, w, h) = faces[0]
+face_roi = gray[y : y + h, x : x + w]
+
+# thoda normalize size
+face_resized = cv2.resize(face_roi, (200, 200))
+samples.append(face_resized)
+labels.append(1) # single identity label = 1
+
+print(f"[FaceID] Sample {len(samples)}/{num_samples} captured.")
+time.sleep(0.3)
+
+cap.release()
+
+if len(samples) < 5:
+return (
+"Mujhe tumhara face sufficient samples ke saath capture nahi ho paya. "
+"Light aur angle thoda better karke phir se try kar sakte ho."
+)
+
+# Train LBPH recognizer
+try:
+self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+self.recognizer.train(samples, np.array(labels))
+self._save_model(name)
+self.name = name.strip() or "Abhay"
+except Exception as e:
+return f"Face model train karte waqt error aaya: {e}"
+
+return (
+f"Theek hai {self.name}, maine tumhara face register kar liya "
+f"({len(samples)} samples). Ab se camera pe tumhe pehchanne ki koshish karunga."
+)
+
+# ---------------- PUBLIC: RECOGNIZE ---------------- #
+
+def recognize_from_camera(
+self,
+camera_index: int = 0,
+timeout_sec: int = 15,
+threshold: float = 80.0,
+) -> str:
+"""
+Webcam se face dekh kar LBPH recognizer se predict karega.
+
+threshold: confidence (OpenCV LBPH me LOWER is better).
+Typical: 50-80 range me threshold.
+"""
+
+lib_err = self._ensure_lib()
+if lib_err:
+return lib_err
+
+if self.recognizer is None:
+return (
+"Abhi tak face model trained nahi hai. "
+"Pehle bolo: 'Jarvis, remember my face' taaki main tumhara face enroll kar saku."
+)
+
+cap = cv2.VideoCapture(camera_index)
+if not cap.isOpened():
+return "Camera open nahi ho raha, please webcam / permissions check karo."
+
+print("[FaceID] Trying to recognize face from camera...")
+
+start = time.time()
+best_conf: Optional[float] = None
+
+while (time.time() - start) < timeout_sec:
+ret, frame = cap.read()
+if not ret or frame is None:
+continue
+
+gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+faces = self.face_cascade.detectMultiScale(
+gray,
+scaleFactor=1.2,
+minNeighbors=5,
+minSize=(80, 80),
+)
+
+if not len(faces):
+continue
+
+# sirf first face consider karenge
+(x, y, w, h) = faces[0]
+face_roi = gray[y : y + h, x : x + w]
+face_resized = cv2.resize(face_roi, (200, 200))
+
+try:
+label, confidence = self.recognizer.predict(face_resized)
+except Exception as e:
+print("[FaceID] predict error:", e)
+continue
+
+print(f"[FaceID] label={label}, confidence={confidence:.2f} (thresh={threshold})")
+
+# LBPH me confidence jitna kam utna better
+if label == 1 and confidence <= threshold:
+best_conf = confidence
+break
+
+cap.release()
+
+if best_conf is None:
+return (
+"Mujhe camera pe tumhara face toh dikh raha hoga, "
+"lekin stored profile se confident match nahi mila. "
+"Light / angle thoda better karke dubara try kar sakte ho."
+)
+
+# Personalized message
+nm = self.name or "Abhay"
+if nm.lower() in ("abhay", "abhay pratap singh", "abhay singh"):
+return "Haan Abhay, main tumhe camera par clearly dekh sakta hoon. 👀"
+else:
+return f"Mujhe lagta hai tum {nm} ho. 👀 (confidence ~{best_conf:.1f})"
+# memory/background_jobs.py
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional
+
+
+@dataclass
+class JobResult:
+job_id: str
+title: str
+status: str # "queued" | "running" | "done" | "error"
+created_ts: float = field(default_factory=lambda: time.time())
+done_ts: float = 0.0
+message: str = ""
+output_text: str = ""
+
+
+class BackgroundJobManager:
+"""
+Minimal background job runner (single-thread worker).
+Keeps results in memory. (You can later persist to JSON if you want.)
+"""
+def __init__(self):
+self._lock = threading.Lock()
+self._jobs: Dict[str, JobResult] = {}
+self._queue: list[tuple[str, Callable[[], str]]] = []
+self._worker = threading.Thread(target=self._loop, daemon=True)
+self._started = False
+
+def start(self) -> None:
+if not self._started:
+self._started = True
+self._worker.start()
+
+def submit(self, job_id: str, title: str, fn: Callable[[], str]) -> str:
+with self._lock:
+self._jobs[job_id] = JobResult(job_id=job_id, title=title, status="queued")
+self._queue.append((job_id, fn))
+return job_id
+
+def get(self, job_id: str) -> Optional[JobResult]:
+with self._lock:
+return self._jobs.get(job_id)
+
+def pop_done_messages(self) -> list[JobResult]:
+"""
+Returns completed jobs that haven't been 'announced' yet.
+We'll mark them by clearing message after reading.
+"""
+out: list[JobResult] = []
+with self._lock:
+for jid, jr in list(self._jobs.items()):
+if jr.status in ("done", "error") and jr.message:
+out.append(jr)
+# mark as announced
+jr.message = ""
+return out
+
+def _loop(self) -> None:
+while True:
+job: Optional[tuple[str, Callable[[], str]]] = None
+with self._lock:
+if self._queue:
+job = self._queue.pop(0)
+
+if not job:
+time.sleep(0.15)
+continue
+
+job_id, fn = job
+try:
+with self._lock:
+self._jobs[job_id].status = "running"
+result_text = fn()
+with self._lock:
+jr = self._jobs[job_id]
+jr.status = "done"
+jr.done_ts = time.time()
+jr.output_text = result_text
+jr.message = f"✅ '{jr.title}' complete."
+except Exception as e:
+with self._lock:
+jr = self._jobs[job_id]
+jr.status = "error"
+jr.done_ts = time.time()
+jr.output_text = ""
+jr.message = f"❌ '{jr.title}' failed: {e}"
+# memory/background_learner.py
+
+from __future__ import annotations
+
+import threading
+import time
+
+
+class BackgroundLearner(threading.Thread):
+"""
+Simple background learner thread.
+
+main.py me use:
+from memory.background_learner import BackgroundLearner
+
+bg_learner = BackgroundLearner(brain=brain, interval_seconds=600)
+bg_learner.start()
+
+- Har interval pe 'brain' ko halka sa learning tick dene ki koshish karega.
+- Agar brain me background_tick() method nahi hai to sirf log print karega.
+"""
+
+def __init__(self, brain=None, interval_seconds: int = 600):
+super().__init__(daemon=True)
+self.brain = brain
+# safety: at least 60 sec
+self.interval = max(60, int(interval_seconds))
+self._stop_flag = threading.Event()
+
+# memory/background_learner.py
+def start(self):
+if getattr(self, "_started", False):
+return
+self._started = True
+# ... existing start logic ...
+
+def run(self):
+print(f"[BackgroundLearner] Started with interval={self.interval} seconds")
+while not self._stop_flag.is_set():
+# interval wait, but breakable per second
+for _ in range(self.interval):
+if self._stop_flag.is_set():
+break
+time.sleep(1)
+
+if self._stop_flag.is_set():
+break
+
+try:
+if self.brain is not None and hasattr(self.brain, "background_tick"):
+# Future ke liye hook: agar tum BrainLLM me yeh method banao
+self.brain.background_tick()
+else:
+# Abhi ke liye sirf log
+print("[BackgroundLearner] tick (no background_tick() on brain)")
+except Exception as e:
+print("[BackgroundLearner] error:", e)
+
+print("[BackgroundLearner] Stopped.")
+
+def stop(self):
+self._stop_flag.set()
+# memory/memory_store.py
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional
+
+
+@dataclass
+class MemoryItem:
+text: str
+category: str = "note" # e.g. "fact", "preference", "habit", "skill"
+source: str = "manual" # e.g. "manual", "auto", "background_learner"
+tags: List[str] | None = None
+ts: float = 0.0 # unix timestamp
+
+def to_dict(self) -> dict:
+d = asdict(self)
+if d["tags"] is None:
+d["tags"] = []
+if not d["ts"]:
+d["ts"] = time.time()
+return d
+
+@classmethod
+def from_dict(cls, d: dict) -> "MemoryItem":
+return cls(
+text=d.get("text", ""),
+category=d.get("category", "note"),
+source=d.get("source", "manual"),
+tags=d.get("tags") or [],
+ts=float(d.get("ts") or time.time()),
+)
+
+
+class MemoryStore:
+"""
+Simple JSON-based memory store.
+"""
+
+def __init__(self, path: Path):
+self._path = path
+self._lock = threading.Lock()
+self._items: List[MemoryItem] = []
+self._load()
+
+def _load(self) -> None:
+if not self._path.exists():
+self._items = []
+return
+try:
+raw = self._path.read_text(encoding="utf-8")
+data = json.loads(raw or "[]")
+self._items = [MemoryItem.from_dict(x) for x in data]
+except Exception as e:
+print("[MemoryStore] Failed to load memory:", e)
+self._items = []
+
+def _save(self) -> None:
+try:
+data = [m.to_dict() for m in self._items]
+self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+except Exception as e:
+print("[MemoryStore] Failed to save memory:", e)
+
+def add(self, text: str, category: str = "note", source: str = "manual", tags: Optional[List[str]] = None) -> MemoryItem:
+with self._lock:
+item = MemoryItem(
+text=text.strip(),
+category=category,
+source=source,
+tags=tags or [],
+ts=time.time(),
+)
+self._items.append(item)
+self._save()
+return item
+
+def all_items(self) -> List[MemoryItem]:
+with self._lock:
+return list(self._items)
+
+def last_n(self, n: int = 20) -> List[MemoryItem]:
+with self._lock:
+return self._items[-n:]
+
+
+_store: Optional[MemoryStore] = None
+
+
+def get_memory_store() -> MemoryStore:
+global _store
+if _store is None:
+base_dir = Path(__file__).resolve().parent
+mem_path = base_dir / "memory_data.json"
+_store = MemoryStore(mem_path)
+print(f"[MemoryStore] Using memory file at: {mem_path}")
+return _store
+#whisper_cpp.py
+import tempfile
+import sounddevice as sd
+import soundfile as sf
+from faster_whisper import WhisperModel
+from config import DEVICE
+
+
+class WhisperSTT:
+"""
+STT using faster-whisper (CTranslate2 backend).
+Works offline, supports Hindi + English, works on CPU and CUDA.
+"""
+
+def __init__(self, lang: str = "auto", model_size: str = "small"):
+self.lang = lang
+
+device = DEVICE # "cuda" if available else "cpu"
+# int8 is fine for both CPU and GPU, keeps memory usage low.
+compute_type = "int8"
+
+print(f"[faster-whisper] Loading model '{model_size}' on device '{device}'...")
+self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+def record_to_wav(self, duration: int = 5, samplerate: int = 16000) -> str:
+print("🎙️ Listening...")
+audio = sd.rec(
+int(duration * samplerate),
+samplerate=samplerate,
+channels=1,
+dtype="int16",
+)
+sd.wait()
+tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+sf.write(tmp.name, audio, samplerate)
+return tmp.name
+
+def transcribe_file(self, wav_path: str) -> str:
+# language=None → autodetect; else e.g. "hi" or "en"
+language = None if self.lang == "auto" else self.lang
+
+segments, info = self.model.transcribe(
+wav_path,
+language=language,
+beam_size=5,
+)
+
+texts = [seg.text for seg in segments]
+full_text = " ".join(texts).strip()
+return full_text
+
+def listen_and_transcribe(self, duration: int = 5) -> str:
+wav = self.record_to_wav(duration=duration)
+text = self.transcribe_file(wav)
+print(f"🗣️ You said: {text}")
+return text
+# tts/tts_edge.py
+
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+import threading
+from typing import Optional
+
+import edge_tts
+import playsound
+
+
+class SimpleTTS:
+"""
+Edge TTS based text-to-speech.
+
+- Hindi + English dono ke liye suitable voices (Neerja / Madhur etc.)
+- main.py ke barge-in logic ke saath compatible:
+- speak(text, stt=None, enable_barge_in=True) -> params accept karta hai
+- is_speaking() -> bool
+- stop() -> speaking flag false (real audio stop har player me possible nahi)
+"""
+
+def __init__(self, voice: str = "hi-IN-MadhurNeural"):
+# Default voice tum already MadhurNeural rakh chuke ho
+self.voice = voice
+self._speaking = False
+self._stop_flag = False
+self._lock = threading.Lock()
+self._current_thread: Optional[threading.Thread] = None
+
+# ------------- internal audio playback ------------ #
+
+def _play_audio(self, path: str):
+try:
+# playsound blocking hai, isliye isko alag thread me chala rahe hain
+playsound.playsound(path, block=True)
+except Exception as e:
+print("[TTS] playsound error:", e)
+finally:
+with self._lock:
+self._speaking = False
+try:
+if os.path.exists(path):
+os.remove(path)
+except Exception:
+pass
+
+async def _speak_async(self, text: str):
+if not text:
+return
+
+# Agar pehle se bol raha hai aur tum fir se speak call kar do
+# to pehle wale ko logically stop mark kar dete hain
+with self._lock:
+self._stop_flag = False
+self._speaking = True
+
+# Temp file for MP3
+fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+os.close(fd)
+
+try:
+communicate = edge_tts.Communicate(text, self.voice)
+await communicate.save(tmp_path)
+except Exception as e:
+with self._lock:
+self._speaking = False
+try:
+if os.path.exists(tmp_path):
+os.remove(tmp_path)
+except Exception:
+pass
+print("[TTS] edge-tts error:", e)
+return
+
+# Agar bolne se pehle hi stop flag set ho gaya
+with self._lock:
+if self._stop_flag:
+self._speaking = False
+try:
+if os.path.exists(tmp_path):
+os.remove(tmp_path)
+except Exception:
+pass
+return
+
+# Start playback in separate thread
+t = threading.Thread(target=self._play_audio, args=(tmp_path,), daemon=True)
+self._current_thread = t
+t.start()
+
+# ------------- public API ------------ #
+
+def speak(self, text: str, stt=None, enable_barge_in: bool = False):
+"""
+main.py isse call karta hai:
+tts.speak(reply, stt=stt, enable_barge_in=True)
+
+yahan stt / enable_barge_in ignore ho rahe hain, kyunki
+real barge-in logic main.py me hai (loop + is_speaking + stop).
+"""
+try:
+asyncio.run(self._speak_async(text))
+except RuntimeError:
+# agar already event loop chal raha ho (rare case),
+# fallback thread me run kara sakte hain
+def _runner():
+asyncio.run(self._speak_async(text))
+
+threading.Thread(target=_runner, daemon=True).start()
+
+def is_speaking(self) -> bool:
+with self._lock:
+return self._speaking
+
+def stop(self):
+"""
+Sirf logical stop:
+- _stop_flag = True => next playback skip ho jayega
+- _speaking = False => main.py ko lagega ki bolna band ho gaya
+
+NOTE: playsound 1.2.2 me beech me audio ko truly stop karna possible nahi hai
+without external player. Practical effect:
+- barge-in hone par hum next STT loop pe chale jaate hain,
+audio thoda sa background me bajta reh sakta hai, but control tumhare paas aa jaata hai.
+"""
+with self._lock:
+self._stop_flag = True
+self._speaking = False
+# utils/audio_io.py
+import sounddevice as sd
+import soundfile as sf
+
+
+def record_wav(path: str, duration: int = 5, samplerate: int = 16000) -> str:
+audio = sd.rec(
+int(duration * samplerate),
+samplerate=samplerate,
+channels=1,
+dtype="int16",
+)
+sd.wait()
+sf.write(path, audio, samplerate)
+return path
+# utils/clipboard.py
+from __future__ import annotations
+
+def get_clipboard_text() -> str:
+"""
+Returns clipboard text using 'pyperclip' if available.
+"""
+try:
+import pyperclip # type: ignore
+txt = pyperclip.paste()
+return (txt or "").strip()
+except Exception:
+return ""
+#job_queue.py
+from __future__ import annotations
+from collections import deque
+from typing import Deque, List, Optional
+
+class JobQueue:
+def __init__(self):
+self._done: Deque[str] = deque()
+
+def push_done(self, msg: str) -> None:
+if msg:
+self._done.append(msg)
+
+def pop_done_messages(self) -> List[str]:
+out: List[str] = []
+while self._done:
+out.append(self._done.popleft())
+return out
+# utils/logger.py
+from datetime import datetime
+
+
+def log(msg: str):
+print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# skills/browser_control.py
+
+from __future__ import annotations
+
+from typing import Callable
+
+import pyautogui
+
+# Safety: fail-safe on top-left corner
+pyautogui.FAILSAFE = True
+
+
+def _safe_action(fn: Callable, *args, **kwargs) -> str:
+"""
+Helper to run pyautogui actions safely with basic error handling.
+"""
+try:
+fn(*args, **kwargs)
+return ""
+except Exception as e:
+return f"Action error: {e}"
+
+
+def handle(text: str) -> str:
+"""
+High-level browser (ya active window) control handler.
+
+Voice examples:
+- "scroll down"
+- "scroll down thoda"
+- "scroll down zyada"
+- "scroll up"
+- "go back"
+- "go forward"
+- "refresh page"
+- "reload"
+- "new tab open karo"
+- "close this tab"
+- "next tab"
+- "previous tab"
+"""
+if not text:
+return "Mere paas browser command clear nahi aayi."
+
+t = text.lower().strip()
+
+# ---------- SCROLLING ---------- #
+if "scroll" in t or "page down" in t or "page up" in t:
+amount = -800 # default down
+
+if "up" in t or "upar" in t or "top" in t:
+amount = 800 # scroll up
+
+# fine control
+if any(w in t for w in ["thoda", "little", "kam"]):
+amount = int(amount / 2)
+if any(w in t for w in ["zyada", "fast", "bahut"]):
+amount = amount * 2
+
+err = _safe_action(pyautogui.scroll, amount)
+if err:
+return "Scrolling karte waqt kuch error aa gaya: " + err
+
+direction = "up" if amount > 0 else "down"
+return f"Page ko {direction} scroll kar diya."
+
+# ---------- NAVIGATION: BACK / FORWARD ---------- #
+if any(w in t for w in ["go back", "back ja", "peeche ja", "peeche chalo"]):
+# Alt + Left
+err = _safe_action(pyautogui.hotkey, "alt", "left")
+if err:
+return "Back jaane me thoda issue aa gaya: " + err
+return "Browser ko ek page peeche kar diya."
+
+if any(w in t for w in ["go forward", "aage ja", "aage chalo"]):
+# Alt + Right
+err = _safe_action(pyautogui.hotkey, "alt", "right")
+if err:
+return "Forward jaane me thoda issue aa gaya: " + err
+return "Browser ko ek page aage kar diya."
+
+# ---------- REFRESH / RELOAD ---------- #
+if any(w in t for w in ["refresh", "reload", "page reload", "page refresh"]):
+err = _safe_action(pyautogui.press, "f5")
+if err:
+return "Page refresh karte waqt problem aa gayi: " + err
+return "Page ko refresh kar diya."
+
+# ---------- NEW TAB / CLOSE TAB ---------- #
+if any(w in t for w in ["new tab", "naya tab", "open new tab"]):
+err = _safe_action(pyautogui.hotkey, "ctrl", "t")
+if err:
+return "Naya tab open karne me issue aa gaya: " + err
+return "Naya tab open kar diya."
+
+if any(
+w in t
+for w in [
+"close this tab",
+"close tab",
+"ye tab band karo",
+"tab band karo",
+]
+):
+err = _safe_action(pyautogui.hotkey, "ctrl", "w")
+if err:
+return "Tab band karte waqt issue aa gaya: " + err
+return "Current tab close kar diya."
+
+# ---------- TAB SWITCHING ---------- #
+if any(w in t for w in ["next tab", "agli tab", "aage wala tab"]):
+err = _safe_action(pyautogui.hotkey, "ctrl", "tab")
+if err:
+return "Next tab me switch karne me problem aa gayi: " + err
+return "Next tab pe switch kar diya."
+
+if any(w in t for w in ["previous tab", "pichla tab", "pehle wala tab"]):
+err = _safe_action(pyautogui.hotkey, "ctrl", "shift", "tab")
+if err:
+return "Previous tab me switch karne me problem aa gayi: " + err
+return "Previous tab pe switch kar diya."
+
+# ---------- TOP / BOTTOM (HOME / END) ---------- #
+if any(w in t for w in ["top of page", "page top", "bilkul upar"]):
+err = _safe_action(pyautogui.press, "home")
+if err:
+return "Page ke top par le jaate waqt problem aa gayi: " + err
+return "Page ke top par le gaya."
+
+if any(w in t for w in ["bottom of page", "page end", "bilkul niche"]):
+err = _safe_action(pyautogui.press, "end")
+if err:
+return "Page ke end par le jaate waqt problem aa gayi: " + err
+return "Page ke end par le gaya."
+
+# ---------- ADDRESS BAR FOCUS ---------- #
+if any(
+w in t
+for w in [
+"address bar",
+"url bar",
+"search bar",
+"focus url",
+"focus address bar",
+]
+):
+err = _safe_action(pyautogui.hotkey, "ctrl", "l")
+if err:
+return "Address bar focus karte waqt error aa gaya: " + err
+return "Address bar par focus kar diya."
+
+return "Browser control ko yeh specific command samajh nahi aayi."
+# skills/calculator.py
+
+import re
+
+def _parse_expression(text: str) -> str:
+"""Convert a voice sentence into a math expression string."""
+t = text.lower()
+
+# Remove unnecessary words
+for w in ["calculate", "calculator", "please", "jarvis", "sakha", "hey"]:
+t = t.replace(w, "")
+
+# Map word-operators to symbols
+replacements = {
+"plus": "+",
+"add": "+",
+"minus": "-",
+"subtract": "-",
+"multiplied by": "*",
+"times": "*",
+"into": "*",
+"x": "*",
+"divided by": "/",
+"by": "/",
+"mod": "%",
+"remainder": "%",
+"power of": "**",
+"to the power of": "**",
+}
+# Replace longer phrases first
+for k in sorted(replacements, key=len, reverse=True):
+t = t.replace(k, f" {replacements[k]} ")
+
+# Keep only safe characters
+allowed = "0123456789.+-*/()% "
+expr = "".join(ch for ch in t if ch in allowed)
+return expr.strip()
+
+
+def handle_calculation(text: str) -> str:
+expr = _parse_expression(text)
+if not expr:
+return "Mujhe calculation samajh nahi aayi. Please bolo: 'calculate 25 plus 37'."
+
+try:
+# VERY restricted eval: no builtins
+result = eval(expr, {"__builtins__": {}})
+except Exception as e:
+return f"Expression evaluate nahi ho paya. Error: {e}"
+
+return f"{expr} ka result {result} hai."
+# skills/code_runner.py
+
+from __future__ import annotations
+
+import re
+import time
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+# Workspace root: project ke root se "workspace" folder
+ROOT_DIR = Path(__file__).resolve().parents[1]
+WORKSPACE_DIR = ROOT_DIR / "workspace"
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = WORKSPACE_DIR / "last_code_path.txt"
+
+
+# ----------------- Helpers: language detection ----------------- #
+
+def _detect_language(text: str) -> str:
+"""
+User ke command se target language guess.
+
+Returns: "python", "html", "javascript", "css", "txt"
+"""
+t = text.lower()
+
+if any(kw in t for kw in ["flask", "fastapi", "django", "python", "py script", "py code", "python script"]):
+return "python"
+if any(kw in t for kw in ["html", "landing page", "frontend page", "web page", "portfolio page"]):
+return "html"
+if any(kw in t for kw in ["javascript", "node", "react", "js code"]):
+return "javascript"
+if "css" in t:
+return "css"
+
+# Default
+return "python"
+
+
+def _language_extension(lang: str) -> str:
+lang = lang.lower()
+if lang == "python":
+return "py"
+if lang == "html":
+return "html"
+if lang == "javascript":
+return "js"
+if lang == "css":
+return "css"
+return "txt"
+
+
+# ----------------- Helpers: code fences & prompts ----------------- #
+
+def _clean_code_fences(text: str) -> str:
+"""
+LLM kabhi kabhi ```python ... ``` style code block deta hai.
+Yeh function fences remove karke sirf pure code return karega.
+"""
+fence_pattern = r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)```"
+matches = re.findall(fence_pattern, text, flags=re.DOTALL)
+if matches:
+code = matches[0]
+return code.strip()
+
+return text.strip()
+
+
+def _build_code_prompt(user_request: str, language: str) -> str:
+"""
+BrainLLM ko code generate karne ke liye special instruction.
+"""
+lang_name = language.capitalize()
+
+return (
+f"You are Jarvis, an expert {lang_name} developer.\n"
+f"User request:\n{user_request}\n\n"
+f"Task:\n"
+f"- Write a complete, working {lang_name} code file that satisfies the request.\n"
+f"- Focus on clarity, best practices, and readability.\n"
+f"- Do NOT add any explanation, comments, or markdown text outside the code.\n"
+f"- Do NOT wrap the code in triple backticks if possible.\n"
+f"- Only output the raw {lang_name} code."
+)
+
+
+# ----------------- Helpers: track last generated file ----------------- #
+
+def _save_last_code_path(path: Path) -> None:
+try:
+STATE_FILE.write_text(str(path), encoding="utf-8")
+except Exception as e:
+print("[code_runner] Warning: couldn't write STATE_FILE:", e)
+
+
+def _load_last_code_path() -> Optional[Path]:
+try:
+if not STATE_FILE.exists():
+return None
+txt = STATE_FILE.read_text(encoding="utf-8").strip()
+if not txt:
+return None
+p = Path(txt)
+return p if p.exists() else None
+except Exception as e:
+print("[code_runner] Warning: couldn't read STATE_FILE:", e)
+return None
+
+
+# ----------------- Run Python safely inside workspace ----------------- #
+
+def _run_python_file(path: Path) -> str:
+"""
+Python script ko run karke stdout/stderr capture karega.
+"""
+try:
+# Just in case: ensure file under WORKSPACE_DIR
+try:
+path.relative_to(WORKSPACE_DIR)
+except Exception:
+return "Safety ke liye main sirf workspace ke andar wali Python files run karunga."
+
+cmd = [sys.executable, str(path)]
+proc = subprocess.run(
+cmd,
+capture_output=True,
+text=True,
+cwd=str(WORKSPACE_DIR),
+timeout=60,
+)
+out = proc.stdout.strip()
+err = proc.stderr.strip()
+
+msg_parts = []
+
+if out:
+msg_parts.append(f"Output:\n{out}")
+if err:
+msg_parts.append(f"Errors:\n{err}")
+
+if not msg_parts:
+return "Script successfully run ho gayi, lekin koi visible output nahi aaya."
+
+msg = "\n\n".join(msg_parts)
+
+# Thoda truncate taaki Jarvis ka jawab manageable rahe
+if len(msg) > 1500:
+msg = msg[:1500] + "\n\n[... output truncated ...]"
+
+return msg
+
+except subprocess.TimeoutExpired:
+return "Script run karte waqt timeout ho gaya (60 seconds se zyada lag gaye)."
+except Exception as e:
+return f"Script run karte waqt unexpected error aaya: {e}"
+
+
+# ----------------- Main handler ----------------- #
+
+def handle(text: str, brain=None) -> str:
+"""
+High-level handler for code generation / execution.
+
+Examples (voice):
+
+- "Jarvis, ek Python script banao jo mera Downloads folder scan kare."
+- "Jarvis, ek Flask app bana do jisme /hello route 'Hello Abhay' return kare."
+- "Jarvis, ek simple HTML landing page generate karo mera portfolio ke liye."
+- "Jarvis, abhi jo code banaya tha usko run karo."
+- "Jarvis, is code ko execute karo."
+"""
+if brain is None:
+return "Mere paas abhi coding ke liye brain object available nahi hai."
+
+t = text.lower()
+
+# -------- RUN MODE: "run/execute/chalao" type commands -------- #
+run_keywords = [
+"run", "execute", "chalao", "isko run karo", "isko chala do",
+"code run karo", "script run karo", "program run karo",
+]
+if any(kw in t for kw in run_keywords):
+last_path = _load_last_code_path()
+if not last_path:
+return (
+"Abhi mere paas koi recent generated code file ka record nahi hai.\n"
+"Pehle mujhe bolo 'ek python script banao...' phir main usko run kar sakta hoon."
+)
+
+if last_path.suffix.lower() == ".py":
+result = _run_python_file(last_path)
+return (
+f"Thik hai Abhay, maine yeh Python file run kar di hai:\n"
+f"{last_path}\n\n"
+f"{result}"
+)
+else:
+# Non-Python: run directly nahi karenge, sirf info denge
+return (
+f"Last generated file Python script nahi hai, balki '{last_path.suffix}' type hai.\n"
+f"Path:\n{last_path}\n\n"
+f"Isko run karne ke bajaye tum browser/editor se open kar sakte ho."
+)
+
+# -------- GENERATE MODE: new code file banana -------- #
+language = _detect_language(text)
+ext = _language_extension(language)
+
+code_prompt = _build_code_prompt(text, language)
+
+history = [
+{"role": "user", "content": code_prompt}
+]
+raw = brain.chat(history)
+code = _clean_code_fences(raw)
+
+if not code:
+return "Mujhe code generate karne mein thoda issue aaya. Thoda aur clear instruction do."
+
+ts = time.strftime("%Y%m%d_%H%M%S")
+base_name = f"jarvis_{language}_code_{ts}.{ext}"
+file_path = WORKSPACE_DIR / base_name
+
+try:
+file_path.write_text(code, encoding="utf-8")
+_save_last_code_path(file_path)
+except Exception as e:
+print("[code_runner] Error writing file:", e)
+return (
+"Code to generate ho gaya tha, lekin file likhte waqt error aaya. "
+"Console logs check karo."
+)
+
+return (
+f"Abhay, maine ek {language} code file generate kar di hai.\n"
+f"File path:\n{file_path}\n\n"
+f"Ab agar bolo 'Jarvis, is code ko run karo', to main is file ko Python se run karke "
+f"output bhi bata sakta hoon (agar yeh .py script hai)."
+)
+# skills/desktop_control.py
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+import psutil
+
+# Optional (UI/window control)
+try:
+import pygetwindow as gw
+except Exception:
+gw = None
+
+try:
+import pyautogui
+except Exception:
+pyautogui = None
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+KNOWN_APP_ALIASES = {
+"brave": ["brave", "brave browser"],
+"chrome": ["chrome", "google chrome"],
+"edge": ["edge", "microsoft edge"],
+"firefox": ["firefox"],
+"notepad": ["notepad"],
+"calculator": ["calculator", "calc"],
+"explorer": ["explorer", "file explorer"],
+"cmd": ["cmd", "command prompt"],
+"powershell": ["powershell"],
+"vs code": ["code", "vscode", "vs code", "visual studio code"],
+}
+
+
+KNOWN_EXE_HINTS = {
+"brave": [
+r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
+],
+"chrome": [
+r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+],
+"edge": [
+r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+],
+"firefox": [
+r"C:\Program Files\Mozilla Firefox\firefox.exe",
+r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+],
+"vscode": [
+r"C:\Program Files\Microsoft VS Code\Code.exe",
+r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
+r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+],
+}
+
+
+def _norm(s: str) -> str:
+return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _expand(p: str) -> str:
+return os.path.expandvars(p)
+
+
+def _is_probably_path(text: str) -> bool:
+t = text.strip()
+if not t:
+return False
+# drive path or UNC or contains slashes
+return bool(re.match(r"^[a-zA-Z]:\\", t)) or t.startswith("\\\\") or ("\\" in t) or ("/" in t)
+
+
+def _windows_start_open(target: str) -> None:
+# Use cmd "start" to open apps/urls/files/folders
+# /D handles directory, quotes required
+subprocess.Popen(['cmd', '/c', 'start', '', target], shell=False)
+
+
+def _try_startfile(target: str) -> bool:
+try:
+os.startfile(target) # type: ignore[attr-defined]
+return True
+except Exception:
+return False
+
+
+def _which_exe(name: str) -> Optional[str]:
+# try PATH
+if not name.lower().endswith(".exe"):
+name_exe = name + ".exe"
+else:
+name_exe = name
+p = shutil.which(name_exe)
+return p
+
+
+def _guess_app_key(user_app: str) -> str:
+t = _norm(user_app)
+for key, aliases in KNOWN_APP_ALIASES.items():
+if t == key or t in aliases:
+return key
+# if "brave browser" etc.
+for key, aliases in KNOWN_APP_ALIASES.items():
+for a in aliases:
+if a in t:
+return key
+return t
+
+
+def _find_exe_for_app(app_name: str) -> Optional[str]:
+"""
+Best-effort exe resolver:
+1) known hints
+2) where.exe
+3) shutil.which
+"""
+key = _guess_app_key(app_name)
+
+# 1) known hints
+if key in KNOWN_EXE_HINTS:
+for p in KNOWN_EXE_HINTS[key]:
+ep = _expand(p)
+if os.path.isfile(ep):
+return ep
+
+# 2) where.exe (works for PATH + registered)
+try:
+res = subprocess.run(
+["where", key if key.endswith(".exe") else (key + ".exe")],
+capture_output=True,
+text=True,
+timeout=2,
+)
+if res.returncode == 0:
+line = (res.stdout.splitlines() or [""])[0].strip()
+if line and os.path.isfile(line):
+return line
+except Exception:
+pass
+
+# 3) PATH
+p = _which_exe(key)
+if p and os.path.isfile(p):
+return p
+
+return None
+
+
+def _extract_after_keywords(text: str, keywords: List[str]) -> str:
+t = text.strip()
+low = t.lower()
+for kw in keywords:
+idx = low.find(kw)
+if idx != -1:
+return t[idx + len(kw) :].strip(" :,-")
+return t
+
+
+def _get_active_window_title() -> Optional[str]:
+if gw is None:
+return None
+try:
+w = gw.getActiveWindow()
+if w:
+return (w.title or "").strip() or None
+except Exception:
+return None
+return None
+
+
+def _find_windows_by_title_contains(q: str):
+if gw is None:
+return []
+qn = _norm(q)
+wins = []
+try:
+for w in gw.getAllWindows():
+title = _norm(w.title or "")
+if title and qn in title:
+wins.append(w)
+except Exception:
+return []
+return wins
+
+
+def _close_windows_by_title_contains(q: str) -> int:
+wins = _find_windows_by_title_contains(q)
+closed = 0
+for w in wins:
+try:
+w.close()
+closed += 1
+except Exception:
+pass
+return closed
+
+
+def _kill_processes_by_name(name: str) -> int:
+"""
+Kill processes matching name (exe base match).
+"""
+key = _guess_app_key(name)
+killed = 0
+# try kill by exact exe name
+targets = set()
+
+# If user said "brave", process is brave.exe
+targets.add(key if key.endswith(".exe") else f"{key}.exe")
+
+# also include alias exe guesses
+if key in ("brave", "chrome", "edge", "firefox", "vscode"):
+targets.add(f"{key}.exe")
+
+# psutil iterate
+for p in psutil.process_iter(["pid", "name"]):
+try:
+pname = (p.info.get("name") or "").lower()
+if pname in targets or any(pname == t.lower() for t in targets):
+p.terminate()
+killed += 1
+except Exception:
+pass
+
+# wait a bit then force kill if still alive
+if killed:
+try:
+gone, alive = psutil.wait_procs(
+[p for p in psutil.process_iter(["name"]) if (p.info.get("name") or "").lower() in {t.lower() for t in targets}],
+timeout=1.5,
+)
+for p in alive:
+try:
+p.kill()
+except Exception:
+pass
+except Exception:
+pass
+
+# fallback: taskkill (helps when psutil permissions fail)
+if killed == 0:
+try:
+for t in targets:
+subprocess.run(["taskkill", "/F", "/IM", t], capture_output=True, text=True)
+# can't know exact count reliably
+except Exception:
+pass
+
+return killed
+
+
+# ----------------------------
+# Main handler
+# ----------------------------
+
+def handle(text: str) -> str:
+"""
+Desktop control:
+- open <app/folder/path>
+- close <app> / close active / close this
+- minimize / maximize / switch window
+"""
+if not text or not text.strip():
+return "Kya open ya close karna hai?"
+
+raw = text.strip()
+t = _norm(raw)
+
+# ---- OPEN ----
+if t.startswith("open ") or t.startswith("launch ") or t.startswith("start ") or " open " in t or "launch " in t:
+target = _extract_after_keywords(raw, ["open", "launch", "start"])
+if not target:
+return "Kya open karna hai? App ya folder ka naam bolo."
+
+# If user spoke a path
+if _is_probably_path(target):
+path = target.replace("/", "\\")
+if os.path.isdir(path) or os.path.isfile(path):
+if _try_startfile(path):
+return f"Open kar diya: {Path(path).name}"
+_windows_start_open(path)
+return f"Open kar diya: {Path(path).name}"
+# even if not exists, attempt open (maybe URL)
+try:
+_windows_start_open(target)
+return f"Open kar raha hoon: {target}"
+except Exception:
+return f"Mujhe yeh path nahi mila: {target}"
+
+# Known folders quick
+folder_map = {
+"downloads": str(Path.home() / "Downloads"),
+"documents": str(Path.home() / "Documents"),
+"desktop": str(Path.home() / "Desktop"),
+"pictures": str(Path.home() / "Pictures"),
+"videos": str(Path.home() / "Videos"),
+}
+key = _norm(target)
+for k, p in folder_map.items():
+if k in key and os.path.isdir(p):
+_try_startfile(p) or _windows_start_open(p)
+return f"{k.capitalize()} folder open kar diya."
+
+# Find exe
+exe = _find_exe_for_app(target)
+if exe:
+try:
+subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+return f"{target} open kar diya."
+except Exception:
+# fallback to start
+try:
+_windows_start_open(exe)
+return f"{target} open kar diya."
+except Exception:
+return f"{target} open karne me issue aa gaya."
+
+# Last fallback: Windows start with name
+try:
+_windows_start_open(target)
+return f"{target} open kar raha hoon."
+except Exception:
+return f"Main {target} ko open nahi kar paaya. App ka exact naam ya path bolo."
+
+# ---- CLOSE ----
+if t.startswith("close ") or t.startswith("band ") or " close " in t:
+# close active
+if any(x in t for x in ["close active", "close this", "close current", "isko band", "isko close", "active band"]):
+title = _get_active_window_title()
+if title:
+closed = _close_windows_by_title_contains(title)
+if closed:
+return "Active window close kar di."
+# fallback alt+f4
+if pyautogui:
+try:
+pyautogui.hotkey("alt", "f4")
+return "Active window close kar di."
+except Exception:
+pass
+return "Active window close nahi ho paayi."
+
+target = _extract_after_keywords(raw, ["close", "band", "quit", "exit"])
+if not target:
+return "Kis app ko close karna hai?"
+
+# First try close windows by title (graceful)
+closed_w = _close_windows_by_title_contains(target)
+if closed_w:
+return f"{target} close kar diya."
+
+# Then kill process
+killed = _kill_processes_by_name(target)
+if killed > 0:
+return f"{target} close kar diya."
+return f"Mujhe {target} close karne ke liye exact app name nahi mila."
+
+# ---- MINIMIZE / MAXIMIZE / SWITCH ----
+if any(w in t for w in ["minimize", "minimise", "small", "minim"]):
+if gw:
+try:
+w = gw.getActiveWindow()
+if w:
+w.minimize()
+return "Window minimize kar di."
+except Exception:
+pass
+if pyautogui:
+try:
+pyautogui.hotkey("win", "down")
+return "Window minimize kar di."
+except Exception:
+pass
+return "Window minimize nahi ho paayi."
+
+if "maximize" in t or "full screen" in t or "fullscreen" in t:
+if gw:
+try:
+w = gw.getActiveWindow()
+if w:
+w.maximize()
+return "Window maximize kar di."
+except Exception:
+pass
+if pyautogui:
+try:
+pyautogui.hotkey("win", "up")
+return "Window maximize kar di."
+except Exception:
+pass
+return "Window maximize nahi ho paayi."
+
+if any(w in t for w in ["switch", "next window", "tab change", "window change", "alt tab"]):
+if pyautogui:
+try:
+pyautogui.hotkey("alt", "tab")
+return "Window switch kar di."
+except Exception:
+pass
+return "Window switch nahi ho paayi."
+
+# fallback
+return "Desktop control me yeh command match nahi hui. Try: open/close/minimize/maximize."
+# skills/dev_agent.py
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from pathlib import Path
+from typing import Optional
+
+
+# Dev projects folder – project root ke andar banayenge
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DEV_DIR = ROOT_DIR / "dev_projects"
+DEV_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _detect_language(text: str) -> str:
+"""
+User ki command se expected language guess karne ki koshish.
+"""
+t = text.lower()
+if "python" in t or "py script" in t:
+return "python"
+if "javascript" in t or "node" in t or "js" in t:
+return "javascript"
+if "html" in t or "website" in t or "webpage" in t:
+return "html"
+if "css" in t:
+return "css"
+if "c++" in t or "cpp" in t:
+return "cpp"
+if "java " in t or t.startswith("java"):
+return "java"
+# default
+return "python"
+
+
+def _default_extension(lang: str) -> str:
+if lang == "python":
+return ".py"
+if lang == "javascript":
+return ".js"
+if lang == "html":
+return ".html"
+if lang == "css":
+return ".css"
+if lang == "cpp":
+return ".cpp"
+if lang == "java":
+return ".java"
+return ".txt"
+
+
+def _slugify(text: str, max_len: int = 32) -> str:
+text = text.strip().lower()
+text = re.sub(r"[^a-z0-9]+", "_", text)
+text = re.sub(r"_+", "_", text).strip("_")
+if not text:
+text = "project"
+return text[:max_len]
+
+
+def _extract_code_from_llm(raw: str) -> str:
+"""
+LLM output me se ``` blocks detect karke code nikalne ki koshish.
+Agar nahi mila to pura text hi code ki tarah treat karenge.
+"""
+if "```" not in raw:
+return raw.strip()
+
+parts = raw.split("```")
+# odd indices pe content aata hai
+for i in range(1, len(parts), 2):
+block = parts[i]
+# agar language tag laga ho to pehla line skip
+lines = block.splitlines()
+if not lines:
+continue
+if lines[0].strip().startswith(("python", "py", "js", "javascript", "html", "css")):
+code = "\n".join(lines[1:])
+else:
+code = "\n".join(lines)
+code = code.strip()
+if code:
+return code
+
+return raw.strip()
+
+
+def handle(text: str, brain) -> str:
+"""
+High-level dev / coding agent.
+
+Example commands:
+- "Jarvis ek python script banao jo ek folder me sare images resize kare"
+- "Mere liye ek simple todo CLI app banao"
+- "ek basic responsive website ka code likho"
+
+:param text: user ka raw command
+:param brain: BrainLLM instance
+"""
+if brain is None:
+return "Mere paas abhi coding ke liye brain instance nahi hai."
+
+if not text:
+return "Dev agent ko clear command nahi mili."
+
+lang = _detect_language(text)
+ext = _default_extension(lang)
+
+# Short description nikalne ke liye
+desc = text
+if len(desc) > 80:
+desc = desc[:80] + "..."
+
+slug = _slugify(desc)
+ts = int(time.time())
+filename = f"{slug}_{ts}{ext}"
+filepath = DEV_DIR / filename
+
+# LLM prompt
+system = (
+"You are a senior software engineer and code generator. "
+"Your job is to produce COMPLETE, ready-to-run code for the user's request. "
+"Do not ask follow-up questions unless absolutely necessary. "
+"Assume reasonable defaults when something is ambiguous. "
+"Use clear English comments. "
+"Return the code inside proper fenced code blocks.\n\n"
+f"Target language preference: {lang}.\n"
+)
+
+prompt = (
+f"{system}\n"
+f"User request:\n{text}\n\n"
+"Please provide the full code implementation. "
+"Avoid long explanations; comments in code are enough."
+)
+
+history = [{"role": "user", "content": prompt}]
+raw_reply = brain.chat(history)
+
+if not raw_reply:
+return "Dev agent se koi output nahi aaya, shayad internal error hua."
+
+code = _extract_code_from_llm(raw_reply)
+
+try:
+filepath.write_text(code, encoding="utf-8")
+except Exception as e:
+return (
+"Code generate ho gaya tha, lekin file save karte waqt error aa gaya:\n"
+f"{e}\n\n"
+"Generated code yeh raha:\n"
+f"{code[:2000]}"
+)
+
+rel_path = os.path.relpath(filepath, ROOT_DIR)
+return (
+f"Abhay, maine tumhari request ke liye code generate kar diya.\n\n"
+f"Language guess: {lang}\n"
+f"File: {filepath}\n"
+f"(Project-relative path: {rel_path})\n\n"
+"Agar chaho to main tumhe code ka overview bhi samjha sakta hoon."
+)
+# skills/download_manager.py
+import re
+from pathlib import Path
+import requests
+from config import DOWNLOAD_DIR, KNOWN_SOFTWARE_SOURCES
+
+def sanitize_filename(name: str) -> str:
+return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
+
+def detect_known_software(text: str):
+t = text.lower()
+for key, info in KNOWN_SOFTWARE_SOURCES.items():
+if key in t:
+return key, info
+return None, None
+
+
+def download_file(url: str, suggested_name: str | None = None) -> str:
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+if not suggested_name:
+suggested_name = url.split("/")[-1] or "downloaded_file"
+safe_name = sanitize_filename(suggested_name)
+out_path = DOWNLOAD_DIR / safe_name
+
+print(f"⬇️ Downloading from {url} to {out_path}")
+
+with requests.get(url, stream=True, timeout=60) as r:
+r.raise_for_status()
+with open(out_path, "wb") as f:
+for chunk in r.iter_content(chunk_size=8192):
+if chunk:
+f.write(chunk)
+
+return str(out_path)
+
+
+def handle_download_intent(text: str) -> str:
+key, info = detect_known_software(text)
+if key and info:
+url = info["url"]
+name = info["name"]
+path = download_file(url, suggested_name=f"{key}_installer.exe")
+return f"I have downloaded {name} from its official source. File path: {path}"
+return (
+"No known safe software detected for auto-download. "
+"Try: 'download python', 'download vlc', 'download vs code', or 'download chrome'."
+)
+# skills/image_gen_sd.py
+import time
+import torch
+from diffusers import StableDiffusionPipeline
+from config import DEVICE, IMAGE_OUTPUT_DIR, SD_MODEL_PATH
+
+
+class ImageGeneratorSD:
+def __init__(self):
+print("⚙️ Loading Stable Diffusion...")
+self.pipe = StableDiffusionPipeline.from_single_file(
+SD_MODEL_PATH,
+torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+safety_checker=None,
+).to(DEVICE)
+
+def generate(self, prompt: str) -> str:
+IMAGE_OUTPUT_DIR.mkdir(exist_ok=True)
+filename = f"img_{int(time.time())}.png"
+out_path = IMAGE_OUTPUT_DIR / filename
+image = self.pipe(prompt).images[0]
+image.save(out_path)
+return str(out_path)
+# skills/knowledge_web.py
+import requests
+
+def _clean_question(text: str) -> str:
+t = text.strip()
+lower = t.lower()
+
+for w in [
+"jarvis",
+"sakha",
+"please",
+"can you",
+"could you",
+"tell me",
+"bolo",
+"batao",
+"batao na",
+]:
+lower = lower.replace(w, "")
+
+lower = lower.strip()
+return lower or t
+
+
+def _duckduckgo_instant_answer(query: str) -> str:
+url = "https://api.duckduckgo.com/"
+params = {
+"q": query,
+"format": "json",
+"no_html": 1,
+"no_redirect": 1,
+}
+
+try:
+r = requests.get(url, params=params, timeout=10)
+r.raise_for_status()
+data = r.json()
+except Exception as e:
+return f"Internet se result laate waqt error aaya: {e}"
+
+text = data.get("AbstractText") or data.get("Abstract") or ""
+if not text and data.get("RelatedTopics"):
+first = data["RelatedTopics"][0]
+if isinstance(first, dict):
+text = first.get("Text", "")
+
+text = (text or "").strip()
+if not text:
+return f"Mujhe is query ke liye koi short summary nahi mili: {query}"
+
+return text
+
+
+def answer_question(text: str) -> str:
+cleaned = _clean_question(text)
+summary = _duckduckgo_instant_answer(cleaned)
+return f"Internet ke hisaab se, {cleaned} ke baare mein yeh mila hai:\n{summary}"
+# skills/memory_skill.py
+
+from __future__ import annotations
+
+from typing import Optional
+
+from memory.memory_store import get_memory_store
+
+
+def _clean_after_phrase(text: str, phrase: str) -> str:
+idx = text.lower().find(phrase)
+if idx == -1:
+return text.strip()
+cut = idx + len(phrase)
+return text[cut:].strip(" .:-").strip()
+
+
+def handle_remember(text: str) -> str:
+"""
+Explicit memory commands:
+- "remember that my favourite language is python"
+- "yaad rakhna ki mujhe dark theme pasand hai"
+"""
+store = get_memory_store()
+t_low = text.lower()
+
+key_phrases = [
+"remember that",
+"remember this",
+"yaad rakhna ki",
+"yaad rakhna",
+"yaad rakh",
+]
+
+content = text
+for p in key_phrases:
+if p in t_low:
+content = _clean_after_phrase(text, p)
+break
+
+if not content:
+return "Kya yaad rakhna hai, thoda clear bolna padega."
+
+store.add(
+text=content,
+category="fact",
+source="manual",
+tags=["manual_remember"],
+)
+return f"Theek hai, main yaad rakh lunga: {content}"
+
+
+def handle_recall(limit: int = 15) -> str:
+"""
+User ke baare me jo yaad hai wo summarize kara deta hai.
+"""
+store = get_memory_store()
+items = store.last_n(limit)
+
+if not items:
+return "Abhi tak mere paas tumhare baare me koi khas memory nahi hai."
+
+lines = ["Mujhe tumhare baare me yeh cheezen yaad hain:"]
+for itm in items:
+lines.append(f"- ({itm.category}) {itm.text}")
+
+return "\n".join(lines)
+
+
+def auto_learn_from_turn(user_text: str, reply: str, brain=None) -> None:
+"""
+Simple auto-learning:
+- "my name is ..."
+- "mera naam ..."
+- "my favourite ... is ..."
+- "i like ..."
+- "i love ..."
+etc.
+"""
+if not user_text:
+return
+
+store = get_memory_store()
+t = user_text.lower()
+
+# name
+if "my name is" in t or "mera naam" in t:
+store.add(
+text=user_text.strip(),
+category="fact",
+source="auto",
+tags=["name", "auto_learn"],
+)
+
+# favourites
+if "my favourite" in t or "my favorite" in t or "mera favourite" in t:
+store.add(
+text=user_text.strip(),
+category="preference",
+source="auto",
+tags=["favorite", "auto_learn"],
+)
+
+# likes
+if "i like" in t or "i love" in t or "mujhe pasand" in t or "mujhe acha lagta" in t:
+store.add(
+text=user_text.strip(),
+category="preference",
+source="auto",
+tags=["like", "auto_learn"],
+)
+
+# coding / study habits
+if "i code" in t or "coding" in t or "programming" in t or "padhta hoon" in t or "study" in t:
+store.add(
+text=user_text.strip(),
+category="habit",
+source="auto",
+tags=["work_habit", "auto_learn"],
+)
+
+
+# Helper if router ever wants a generic handler
+def handle(text: str) -> str:
+t = text.lower()
+if any(kw in t for kw in ["remember that", "remember this", "yaad rakh"]):
+return handle_remember(text)
+if "what do you remember about me" in t or "tum mere bare mein kya jante ho" in t:
+return handle_recall()
+return "Memory module ko yeh specific command samajh nahi aayi."
+# skills/planner.py
+
+from __future__ import annotations
+
+from typing import Optional, List, Dict
+
+
+def handle(text: str, brain) -> str:
+"""
+High-level planner agent.
+
+Example commands:
+- "Jarvis, mere liye machine learning seekhne ka roadmap banao"
+- "Jarvis, web dev seekhne ke liye step by step plan do"
+- "Mujhe next 3 months ka study plan chahiye"
+
+:param text: user command
+:param brain: BrainLLM instance
+"""
+if brain is None:
+return "Planner ke paas abhi brain instance nahi hai."
+
+if not text:
+return "Planner ko clear command nahi mili."
+
+system = (
+"You are a planning and strategy assistant. "
+"Given the user's goal, you produce a clear, structured, step-by-step plan.\n\n"
+"Rules:\n"
+"- Break into phases (Phase 1, Phase 2, ...), har phase me steps.\n"
+"- For each step, mention approximate time (e.g., 1–2 weeks, 2–3 days).\n"
+"- Keep it practical for a student like Abhay.\n"
+"- Use a mix of simple English + Hindi (Hinglish), but keep structure clean.\n"
+"- Avoid unnecessary motivational speeches; focus on concrete steps.\n"
+)
+
+prompt = (
+f"{system}\n"
+f"User goal / request:\n{text}\n\n"
+"Please respond as a structured plan, like:\n"
+"Phase 1: ...\n"
+" - Step 1: ...\n"
+" - Step 2: ...\n"
+"Phase 2: ...\n"
+" - Step 3: ...\n"
+"and so on."
+)
+
+history: List[Dict[str, str]] = [{"role": "user", "content": prompt}]
+reply = brain.chat(history)
+if not reply:
+return "Planner ko plan banate waqt problem aa gayi, koi output nahi mila."
+
+return reply.strip()
+# skills/reader.py
+
+from pathlib import Path
+import PyPDF2
+
+from config import BASE_DIR
+
+BOOKS_DIR = BASE_DIR / "books"
+
+
+def _list_books():
+BOOKS_DIR.mkdir(exist_ok=True)
+return list(BOOKS_DIR.glob("*.pdf")) + list(BOOKS_DIR.glob("*.txt"))
+
+
+def _find_book(keyword: str):
+keyword = keyword.lower().strip()
+for f in _list_books():
+if keyword in f.stem.lower():
+return f
+return None
+
+
+def read_book_snippet(text: str) -> str:
+# Try to extract a keyword after "read", "book", etc.
+t = text.lower()
+for w in ["read", "kitab", "book", "jarvis", "sakha", "please"]:
+t = t.replace(w, "")
+keyword = t.strip()
+
+if not keyword:
+# List available books
+books = _list_books()
+if not books:
+return "Books folder khaali hai. books/ mein PDF ya text files daalo."
+names = ", ".join(f.stem for f in books)
+return f"Kaunsi book padhni hai? Mere paas yeh books hain: {names}."
+
+BOOKS_DIR.mkdir(exist_ok=True)
+book_path = _find_book(keyword)
+
+if not book_path:
+return f"Mujhe '{keyword}' naam se koi book books folder mein nahi mili."
+
+if book_path.suffix.lower() == ".txt":
+data = book_path.read_text(encoding="utf-8", errors="ignore")
+snippet = data[:1500]
+return f"Main '{book_path.name}' se ek hissa padh raha hoon:\n{snippet}"
+
+if book_path.suffix.lower() == ".pdf":
+try:
+reader = PyPDF2.PdfReader(str(book_path))
+text_accum = ""
+# First 3 pages only, otherwise bohot lamba ho jayega
+for page in reader.pages[:3]:
+text_accum += page.extract_text() or ""
+snippet = (text_accum or "").strip()[:1500]
+if not snippet:
+return f"'{book_path.name}' se text extract nahi ho paya."
+return f"Main '{book_path.name}' ke first pages se hissa padh raha hoon:\n{snippet}"
+except Exception as e:
+return f"PDF padhte waqt error aaya: {e}"
+
+return f"'{book_path.name}' ka format abhi supported nahi hai."
+# skills/router.py
+from __future__ import annotations
+from .image_gen_sd import ImageGeneratorSD
+from .video_gen_svd import VideoGeneratorSVD
+from . import download_manager
+from . import web_tools
+from . import calculator
+from . import translator
+from . import reader
+from . import screen_tools
+from . import vision_tools
+from . import video_tools
+from . import knowledge_web
+from . import memory_skill
+from . import desktop_control
+from . import tasks
+from utils.job_queue import JobQueue
+
+class IntentRouter:
+def __init__(self):
+self.jobs = JobQueue()
+self.img_gen = ImageGeneratorSD()
+self.vid_gen = VideoGeneratorSVD()
+
+def detect_intent(self, text: str) -> str:
+if not text:
+return "chat"
+
+t = text.lower().strip()
+
+# Tasks (youtube download etc.)
+if "download" in t and any(kw in t for kw in ["youtube", "video", "audio", "song", "gana", "mp3"]):
+return "tasks"
+
+# Vision
+if any(kw in t for kw in ["read the screen", "read screen", "screen par", "screen pe", "what's on my screen",
+"camera", "webcam", "face detect", "mujhe camera pe"]):
+return "vision"
+
+# Desktop control (open/close/minimize/maximize)
+if any(kw in t for kw in ["open ", "launch ", "start ", "close ", "band ", "minimize", "maximize", "switch window", "alt tab"]):
+return "desktop_control"
+
+# Memory: remember
+if any(kw in t for kw in ["remember that", "remember this", "yaad rakh", "yaad rakhna"]):
+return "memory_add"
+
+# Memory: recall
+if any(kw in t for kw in ["what do you remember about me", "what do you know about me",
+"tum mere bare mein kya jante ho", "tumhe mere baare mein kya yaad hai"]):
+return "memory_query"
+
+# Knowledge Q&A
+if ("who is" in t) or ("who was" in t) or ("what is" in t) or t.startswith("tell me about") or ("kaun hai" in t) or ("kya hai" in t):
+return "knowledge"
+
+# Screen reading shortcut
+if "screen" in t and any(w in t for w in ["read", "padh", "padho", "dekho", "see"]):
+return "read_screen"
+
+# YouTube link summary
+if "youtube.com" in t or "youtu.be" in t:
+return "yt_summary"
+
+# Image gen
+if any(w in t for w in ["image bana", "photo bana", "wallpaper", "ai image", "image generate"]):
+return "image"
+
+# Video gen
+if any(w in t for w in ["video bana", "reel bana", "clip bana", "video generate"]):
+return "video"
+
+# Download/install
+if "download" in t or "install" in t:
+return "download"
+
+# Web search
+if any(w in t for w in ["search", "google", "internet pe", "on internet", "online"]):
+return "web"
+
+# Calculator
+if "calculate" in t or "calculator" in t:
+return "calc"
+
+# Translation
+if any(kw in t for kw in ["translate", "isko hindi me bolo", "isko english me bolo",
+"hindi me translate karo", "english me translate karo"]):
+return "translate"
+
+# Book reading
+if "read book" in t or "kitab" in t or ("book" in t and "screen" not in t):
+return "read_book"
+
+return "chat"
+
+def handle(self, text: str, brain=None, chat_history=None) -> str:
+intent = self.detect_intent(text)
+t = text
+
+try:
+if intent == "tasks":
+return tasks.handle(text) or "Theek hai, task start kar diya."
+
+if intent == "vision":
+return vision_tools.handle(text) or "Vision command execute kar diya."
+
+if intent == "memory_add":
+return memory_skill.handle_remember(text) or "Theek hai, yaad rakh liya."
+
+if intent == "memory_query":
+return memory_skill.handle_recall() or "Abhi mere paas tumhare baare me kuch saved nahi hai."
+
+if intent == "knowledge":
+return knowledge_web.answer_question(t) or "Mujhe iska answer nahi mila."
+
+if intent == "read_screen":
+return screen_tools.read_screen_now() or "Main screen read nahi kar paaya."
+
+if intent == "yt_summary":
+return video_tools.summarize_youtube_link(t) or "Main video ka summary nahi nikaal paaya."
+
+if intent == "image":
+path = self.img_gen.generate(t)
+return f"Image generate ho gayi. Saved at: {path}"
+
+if intent == "video":
+path = self.vid_gen.generate(t)
+return f"Video generate ho gaya (placeholder). Saved at: {path}"
+
+if intent == "download":
+return download_manager.handle_download_intent(t) or "Download task start kar diya."
+
+if intent == "web":
+return web_tools.search_web(t) or "Web search me issue aa gaya."
+
+if intent == "calc":
+return calculator.handle_calculation(t) or "Calculation me issue aa gaya."
+
+if intent == "translate":
+return translator.handle(text, brain=brain) if brain else translator.handle(text)
+
+if intent == "read_book":
+return reader.read_book_snippet(t) or "Book read nahi ho paayi."
+
+if intent == "desktop_control":
+return desktop_control.handle(text) or "Desktop command execute ho gaya."
+
+# fallback chat
+if brain is not None:
+# Provide minimal context
+hist = chat_history or [{"role": "user", "content": text}]
+return brain.chat(hist)
+
+return "Mujhe yeh command samajh nahi aayi."
+
+except Exception as e:
+print("[Router] handle error:", e)
+return "Mujhe command execute karne me issue aa gaya."
+# skills/screen_tools.py
+
+from pathlib import Path
+import tempfile
+
+import mss
+from PIL import Image
+import pytesseract
+
+from config import BASE_DIR
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+# If Tesseract is not in PATH, set full path here, e.g.:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+SCREENSHOTS_DIR = BASE_DIR / "screenshots"
+SCREENSHOTS_DIR.mkdir(exist_ok=True)
+
+
+def capture_screen() -> str:
+"""Take a full-screen screenshot and return image path."""
+with mss.mss() as sct:
+monitor = sct.monitors[1] # primary monitor
+img = sct.grab(monitor)
+
+img_path = SCREENSHOTS_DIR / "screenshot_latest.png"
+Image.frombytes("RGB", img.size, img.rgb).save(img_path)
+
+return str(img_path)
+
+
+def ocr_image(image_path: str) -> str:
+"""Extract text from a given image using Tesseract OCR."""
+try:
+img = Image.open(image_path)
+except Exception as e:
+return f"Screen image open nahi ho paya: {e}"
+
+try:
+text = pytesseract.image_to_string(img, lang="eng+hin")
+except Exception as e:
+return f"OCR run karte waqt error aaya: {e}"
+
+text = text.strip()
+if not text:
+return "Screen par kuch clear text nahi mila. Shayad image ya video hoga."
+
+return text
+
+
+def read_screen_now() -> str:
+"""Capture screen and OCR it."""
+img_path = capture_screen()
+text = ocr_image(img_path)
+
+# Limit spoken length
+if len(text) > 800:
+text = text[:800] + "... (baaki text bohot lamba hai, main chhota hissa padh raha hoon.)"
+
+return f"Screen se mujhe yeh text mila hai:\n{text}"
+# skills/system_control.py
+import subprocess
+import webbrowser
+
+
+def open_application(app_text: str) -> str:
+t = app_text.lower()
+
+if "chrome" in t:
+subprocess.Popen(["start", "chrome"], shell=True)
+return "Opening Google Chrome."
+
+if "notepad" in t:
+subprocess.Popen(["notepad"], shell=True)
+return "Opening Notepad."
+
+if "vs code" in t or "vscode" in t:
+subprocess.Popen(["code"], shell=True)
+return "Opening Visual Studio Code."
+
+if "explorer" in t or "file" in t or "folder" in t:
+subprocess.Popen(["explorer"], shell=True)
+return "Opening File Explorer."
+
+return "I don't know this application yet."
+
+
+def open_website(query: str) -> str:
+query = query.strip()
+if query.startswith("http://") or query.startswith("https://"):
+url = query
+else:
+url = f"https://www.google.com/search?q={query}"
+webbrowser.open(url)
+return f"Opening browser for: {query}"
+# =========================
+# FILE: skills/tasks.py
+# =========================
+
+from __future__ import annotations
+
+import subprocess
+import shutil
+import os
+import re
+
+try:
+import pyperclip
+except ImportError:
+pyperclip = None
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _get_clipboard_text() -> str:
+"""
+Clipboard se text nikaalta hai (agar pyperclip available ho).
+"""
+if pyperclip is None:
+return ""
+try:
+return pyperclip.paste().strip()
+except Exception:
+return ""
+
+
+def _looks_like_url(text: str) -> bool:
+return bool(re.search(r"https?://", text))
+
+
+def _ensure_yt_dlp() -> bool:
+"""
+Check karta hai yt-dlp available hai ya nahi
+"""
+return shutil.which("yt-dlp") is not None
+
+
+# -------------------------
+# Main task handler
+# -------------------------
+
+def handle(text: str) -> str:
+"""
+Tasks entry point (router yahin call karega)
+"""
+t = text.lower()
+
+if not _ensure_yt_dlp():
+return (
+"yt-dlp install nahi hai. "
+"Pehle install karo: pip install -U yt-dlp"
+)
+
+# URL detection:
+url = ""
+
+# 1️⃣ Try clipboard first
+clip = _get_clipboard_text()
+if clip and _looks_like_url(clip):
+url = clip
+
+# 2️⃣ Try text itself
+if not url:
+words = text.split()
+for w in words:
+if _looks_like_url(w):
+url = w
+break
+
+if not url:
+return (
+"Mujhe koi video link nahi mila. "
+"Ya toh link clipboard mein copy karo "
+"ya command mein bolo."
+)
+
+# -------------------------
+# Decide format
+# -------------------------
+
+# Audio intent
+if any(k in t for k in ["audio", "mp3", "song", "gana"]):
+return _download_audio(url)
+
+# Default → video
+return _download_video(url)
+
+
+# -------------------------
+# Download functions
+# -------------------------
+
+def _download_audio(url: str) -> str:
+"""
+YouTube se MP3 download
+"""
+out_dir = "downloads/audio"
+os.makedirs(out_dir, exist_ok=True)
+
+cmd = [
+"yt-dlp",
+"-x",
+"--audio-format",
+"mp3",
+"-o",
+f"{out_dir}/%(title)s.%(ext)s",
+url,
+]
+
+try:
+subprocess.Popen(cmd)
+return (
+"Audio download shuru kar diya hai. "
+"MP3 file downloads folder mein aa jayegi."
+)
+except Exception as e:
+return f"Audio download fail ho gaya: {e}"
+
+
+def _download_video(url: str) -> str:
+"""
+YouTube se best quality video download
+"""
+out_dir = "downloads/video"
+os.makedirs(out_dir, exist_ok=True)
+
+cmd = [
+"yt-dlp",
+"-f",
+"bestvideo+bestaudio/best",
+"-o",
+f"{out_dir}/%(title)s.%(ext)s",
+url,
+]
+
+try:
+subprocess.Popen(cmd)
+return (
+"Video download shuru kar diya hai. "
+"File downloads folder mein aa jayegi."
+)
+except Exception as e:
+return f"Video download fail ho gaya: {e}"
+
+
+# =========================
+# END OF skills/tasks.py
+# =========================
+# skills/translator.py
+
+from __future__ import annotations
+
+from typing import Optional
+import re
+
+
+def _contains_devanagari(text: str) -> bool:
+"""
+Check if text contains Devanagari (Hindi) characters.
+"""
+for ch in text:
+if "\u0900" <= ch <= "\u097F":
+return True
+return False
+
+
+def _detect_target_language(text: str) -> str:
+"""
+Detect kis language me translate karna hai.
+
+Returns:
+"hi" -> target Hindi
+"en" -> target English
+"""
+t = text.lower()
+
+# Explicit hints
+if any(kw in t for kw in ["hindi me", "hindi mein", "in hindi", "to hindi"]):
+return "hi"
+if any(kw in t for kw in ["english me", "english mein", "in english", "to english"]):
+return "en"
+
+# If text itself Devanagari hai, to English me translate
+if _contains_devanagari(text):
+return "en"
+
+# Default: English source -> Hindi target
+return "hi"
+
+
+def _extract_text_to_translate(text: str) -> str:
+"""
+User command se woh part nikalne ki koshish jo actual text hai.
+
+Examples:
+"Jarvis, is line ka Hindi me translation batao: Gravity is important."
+-> "Gravity is important."
+
+"translate this to English: मैं आज बहुत खुश हूँ।"
+-> "मैं आज बहुत खुश हूँ।"
+"""
+# Common patterns
+patterns = [
+r"translation batao[:\- ]*(.*)",
+r"translate this[:\- ]*(.*)",
+r"translate to [a-zA-Z ]+[:\- ]*(.*)",
+r"isko [a-zA-Z ]+ me bolo[:\- ]*(.*)",
+r"is line ka [a-zA-Z ]+ me[:\- ]*(.*)",
+]
+
+for pat in patterns:
+m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
+if m:
+candidate = m.group(1).strip()
+if candidate:
+return candidate
+
+# Fallback: remove leading trigger words
+triggers = [
+"jarvis",
+"please",
+"translate",
+"isko",
+"is line ka",
+"is sentence ka",
+"ka translation",
+"batao",
+"bolo",
+]
+cleaned = text
+for tr in triggers:
+cleaned = re.sub(r"\b" + re.escape(tr) + r"\b", "", cleaned, flags=re.IGNORECASE)
+
+return cleaned.strip(" :,-\n\t")
+
+
+def _translate_with_brain(brain, src_text: str, target_lang: str) -> str:
+"""
+BrainLLM ka use karke translation karna.
+
+target_lang:
+"hi" -> Hindi
+"en" -> English
+"""
+if brain is None:
+return "Mere paas translation ke liye LLM brain available nahi hai."
+
+src_text = src_text.strip()
+if not src_text:
+return "Mujhe kya translate karna hai, woh clear nahi hua."
+
+if target_lang == "hi":
+target_name = "natural Hinglish/Hindi"
+else:
+target_name = "natural English"
+
+prompt = (
+f"Translate the following text into {target_name}.\n"
+f"- Keep the meaning accurate.\n"
+f"- Do NOT explain, only give the translated sentence.\n\n"
+f"Text:\n{src_text}"
+)
+
+history = [
+{"role": "user", "content": prompt}
+]
+translated = brain.chat(history)
+return translated.strip()
+
+
+def handle(text: str, brain=None) -> str:
+"""
+High-level translation handler.
+
+Examples (voice/text):
+- "Jarvis, is line ka Hindi me translation batao: Gravity is the force that keeps us on Earth."
+- "translate this to English: मैं कल दिल्ली जा रहा हूँ।"
+- "isko Hindi me bolo: Machine learning is powerful."
+- "isko English me bolo: मुझे AI pasand hai."
+"""
+# Decide target language
+target_lang = _detect_target_language(text)
+# Extract source text
+src = _extract_text_to_translate(text)
+
+if not src:
+return (
+"Mujhe kya translate karna hai, yeh clear nahi hua. "
+"Example: 'isko Hindi me bolo: Machine learning is powerful.'"
+)
+
+return _translate_with_brain(brain, src, target_lang)
+# skills/video_gen_svd.py
+import time
+from pathlib import Path
+from config import VIDEO_OUTPUT_DIR
+
+
+class VideoGeneratorSVD:
+def __init__(self):
+# TODO: integrate real Stable Video Diffusion pipeline
+self.initialized = False
+
+def generate(self, prompt: str) -> str:
+VIDEO_OUTPUT_DIR.mkdir(exist_ok=True)
+filename = f"video_{int(time.time())}.mp4"
+out_path = VIDEO_OUTPUT_DIR / filename
+# Placeholder video file
+Path(out_path).write_text(f"Placeholder video for prompt: {prompt}")
+return str(out_path)
+# skills/video_tools.py
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+from memory.background_jobs import BackgroundJobManager
+from utils.clipboard import get_clipboard_text
+
+
+_YT_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.I)
+
+def _looks_like_youtube_url(text: str) -> bool:
+return bool(_YT_RE.search(text or ""))
+
+
+def _run(cmd: list[str]) -> str:
+p = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+out = (p.stdout or "") + "\n" + (p.stderr or "")
+if p.returncode != 0:
+raise RuntimeError(out.strip()[:3000])
+return out
+
+
+def _download_audio(url: str, out_dir: Path) -> Path:
+"""
+Uses yt-dlp to download best audio and convert to wav.
+Requires: yt-dlp + ffmpeg in PATH.
+"""
+out_dir.mkdir(parents=True, exist_ok=True)
+outtmpl = str(out_dir / "audio.%(ext)s")
+
+# download audio
+_run([
+"yt-dlp",
+"-x",
+"--audio-format", "wav",
+"--audio-quality", "0",
+"-o", outtmpl,
+url,
+])
+
+# find produced wav
+wavs = list(out_dir.glob("audio*.wav"))
+if not wavs:
+# sometimes ext naming varies
+wavs = list(out_dir.glob("*.wav"))
+if not wavs:
+raise RuntimeError("Audio WAV not found after yt-dlp.")
+return wavs[0]
+
+
+def _transcribe_with_whisper_cpp(stt, wav_path: Path) -> str:
+"""
+Uses your existing WhisperSTT if it has a 'transcribe_file' method.
+If not, fallback to normal listen method won't work here.
+"""
+if hasattr(stt, "transcribe_file"):
+return (stt.transcribe_file(str(wav_path)) or "").strip()
+
+raise RuntimeError("Your WhisperSTT does not support transcribe_file(). Add it, or use faster-whisper file decode.")
+
+
+def _summarize(brain, transcript: str, url: str) -> str:
+prompt = (
+"You are Jarvis. Summarize the following YouTube/video transcript clearly.\n"
+"Rules:\n"
+"- Hinglish friendly, simple.\n"
+"- Bullet points for key takeaways.\n"
+"- If transcript is noisy, say 'audio unclear' and still try.\n\n"
+f"URL: {url}\n\n"
+f"TRANSCRIPT:\n{transcript}\n"
+)
+return (brain.chat([{"role": "user", "content": prompt}]) or "").strip()
+
+
+def start_background_youtube_audio_summary(
+*,
+text: str,
+brain,
+stt,
+jobs: BackgroundJobManager,
+) -> str:
+"""
+Command examples:
+- "analyze this video"
+- "summarize youtube"
+- "youtube summary"
+It will pull URL from clipboard if not present in text.
+"""
+url = ""
+# Try extract URL from text
+for token in (text or "").split():
+if _looks_like_youtube_url(token):
+url = token.strip()
+break
+
+if not url:
+clip = get_clipboard_text()
+if _looks_like_youtube_url(clip):
+url = clip
+
+if not url:
+return "Mujhe YouTube/video link nahi mila. Link copy karo, phir bolo: 'Jarvis, is video ko analyze karo'."
+
+jobs.start()
+
+job_id = f"yt_{abs(hash(url))}"
+title = "YouTube audio summary"
+
+def job_fn() -> str:
+with tempfile.TemporaryDirectory() as td:
+out_dir = Path(td)
+wav = _download_audio(url, out_dir)
+transcript = _transcribe_with_whisper_cpp(stt, wav)
+if not transcript:
+return "Audio se kuch clear transcript nahi bana. Shayad video me speech kam thi ya noise zyada tha."
+summary = _summarize(brain, transcript, url)
+return (
+f"🎬 Video: {url}\n\n"
+f"🧾 Transcript (short):\n{transcript[:1200]}{'...' if len(transcript)>1200 else ''}\n\n"
+f"🧠 Summary:\n{summary}\n"
+)
+
+jobs.submit(job_id=job_id, title=title, fn=job_fn)
+return "Theek hai. Main is video ka **audio-based background analysis** start kar raha hoon. Complete hone par main tumhe bata dunga."
+# skills/vision_tools.py
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+import mss
+import pytesseract
+
+from identity.face_db import FaceIdentityManager
+
+# Global face identity manager
+_FACE_MGR: Optional[FaceIdentityManager] = FaceIdentityManager()
+
+
+# ---------------- SCREEN READING ---------------- #
+
+def read_screen_now() -> str:
+"""
+Current primary screen ka screenshot lekar OCR se text read karta hai.
+"""
+try:
+with mss.mss() as sct:
+monitor = sct.monitors[1] # primary monitor
+shot = sct.grab(monitor)
+img = Image.frombytes("RGB", shot.size, shot.rgb)
+
+text = pytesseract.image_to_string(img, lang="eng")
+text = (text or "").strip()
+
+if not text:
+return "Screen par mujhe koi readable text clear nahi mila, shayad font ya background tricky hai."
+
+return f"Screen se mujhe yeh text mila hai:\n{text}"
+except Exception as e:
+return f"OCR run karte waqt error aaya: {e}"
+
+
+# ---------------- CAMERA: FACE PRESENCE ---------------- #
+
+def check_face_presence_from_camera(duration_seconds: int = 5) -> str:
+"""
+Sirf itna check karta hai ki camera par koi face hai ya nahi.
+"""
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+return "Camera open nahi ho raha, please check webcam / permissions."
+
+face_cascade = cv2.CascadeClassifier(
+cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+start = time.time()
+found = False
+
+while (time.time() - start) < duration_seconds:
+ret, frame = cap.read()
+if not ret or frame is None:
+continue
+
+gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+
+if len(faces) > 0:
+found = True
+break
+
+cap.release()
+
+if found:
+return "Camera par ek face dikh raha hai."
+else:
+return "Mujhe camera par koi clear face nahi dikh raha."
+
+
+# ---------------- IMAGE ANALYSIS (FILE) ---------------- #
+
+def analyze_image_file(path: str) -> str:
+"""
+Local image file ko load karke simple analysis:
+- Agar face visible hai to count
+- OCR se kuch text ho to read
+"""
+if not path:
+return "Kisi image ka path specify nahi kiya gaya."
+
+p = Path(path).expanduser()
+if not p.exists():
+return f"Image file nahi mili: {p}"
+
+img = cv2.imread(str(p))
+if img is None:
+return f"Image load nahi ho payi: {p}"
+
+msg_parts = []
+
+# Face detection
+try:
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+face_cascade = cv2.CascadeClassifier(
+cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+if len(faces) > 0:
+msg_parts.append(f"Image me mujhe {len(faces)} face(s) dikh rahe hain.")
+else:
+msg_parts.append("Image me mujhe koi clear face nahi dikha.")
+except Exception as e:
+msg_parts.append(f"Face detect karte waqt error aaya: {e}")
+
+# OCR
+try:
+pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+text = pytesseract.image_to_string(pil_img, lang="eng")
+text = (text or "").strip()
+if text:
+msg_parts.append("Image se mujhe yeh text mila hai:")
+msg_parts.append(text)
+else:
+msg_parts.append("Image me mujhe koi readable text nahi mila.")
+except Exception as e:
+msg_parts.append(f"OCR me error aaya: {e}")
+
+return "\n".join(msg_parts)
+
+
+# ---------------- FACE IDENTITY (ENROLL + RECOGNIZE) ---------------- #
+
+def enroll_my_face() -> str:
+"""
+Default user (Abhay) ka face enroll karega.
+"""
+if _FACE_MGR is None:
+return "Face identity manager initialize nahi ho paya."
+
+return _FACE_MGR.enroll_from_camera(name="Abhay")
+
+
+def recognize_on_camera() -> str:
+"""
+Camera se dekh kar try karega ki yeh Abhay hai ya koi aur registered profile.
+"""
+if _FACE_MGR is None:
+return "Face identity manager initialize nahi ho paya."
+
+return _FACE_MGR.recognize_from_camera()
+
+
+# ---------------- HIGH-LEVEL HANDLER ---------------- #
+
+def handle(text: str) -> str:
+"""
+Vision related high-level commands ka handler.
+Ye router se call hota hai jab intent == 'vision'.
+"""
+
+if not text:
+return "Vision module ko command clear nahi aayi."
+
+t = text.lower().strip()
+
+# --- Face enroll commands ---
+if any(
+kw in t
+for kw in [
+"remember my face",
+"register my face",
+"meri shakal yaad kar",
+"meri shakal yaad rakh",
+"mera chehra yaad rakh",
+"mera face yaad rakh",
+"face register kar",
+]
+):
+return enroll_my_face()
+
+# --- Face recognize commands ---
+if any(
+kw in t
+for kw in [
+"who am i",
+"do you recognize me",
+"kya tum mujhe pehchante ho",
+"mera chehra pehchano",
+"dekho kaun hai",
+"do you see me",
+]
+):
+return recognize_on_camera()
+
+# --- Simple presence check / see someone on camera ---
+if any(
+kw in t
+for kw in [
+"see someone on camera",
+"camera par koi hai",
+"kya tumhe koi dikhta hai",
+"face detect",
+"check camera",
+"camera check karo",
+]
+):
+return check_face_presence_from_camera(duration_seconds=5)
+
+# --- Screen read (vision intent se bhi) ---
+if "screen" in t and any(
+w in t for w in ["read", "padh", "padho", "dekho", "dekh lo", "see"]
+):
+return read_screen_now()
+
+# Fallback – generic message
+return (
+"Vision module ko yeh command thoda unclear lagi. "
+"Tum bol sakte ho:\n"
+"- 'remember my face' (face enroll)\n"
+"- 'do you recognize me' (face recognize)\n"
+"- 'see someone on camera' (face presence)\n"
+"- 'read the screen' (screen OCR)"
+)
+# skills/web_tools.py
+from . import system_control
+
+def search_web(text: str) -> str:
+cleaned = text.lower()
+for w in ["search", "google", "on google", "internet pe", "on internet"]:
+cleaned = cleaned.replace(w, "")
+cleaned = cleaned.strip()
+return system_control.open_website(cleaned or text)
